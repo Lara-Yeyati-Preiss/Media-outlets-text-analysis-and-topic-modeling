@@ -1,0 +1,631 @@
+---
+title: "Final project: Text analysis and topic modeling"
+author: "Lara Yeyati Preiss"
+date: "February 2022"
+output: 
+  rmdformats::robobook:
+    highlight: kate
+    toc_depth : 3
+    fig_width: 13
+    fig_height: 10
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## Preprocessing
+
+The text corpus consists of articles from Argentinian news outlets between January 2015 and December 2016, in Spanish. The corpus includes the following variables: id, url, date, year, month, day, media, title and text. 
+
+The first step is to load the data, preprocess it and generate a token-per-row matrix for each document
+^[The documents are the articles that are part of the corpus.].
+<br>
+
+
+
+I load the first packages that I will be using.
+
+```{r, message=FALSE, warning=FALSE}
+library(readr)
+library(tidyverse)
+library(tidytext)
+
+```
+
+
+And the corpus data.
+
+```{r, message=FALSE, warning=FALSE}
+corpus<-read_csv(file = "corpus.csv")
+```
+
+
+I change the encoding of the news outlet and text columns to ASCII, in order to remove accents and the character "ñ". 
+
+```{r, message=FALSE, warning=FALSE}
+corpus <- corpus %>%
+                mutate(texto = stringi::stri_trans_general(texto, "Latin-ASCII"),
+                       medio = stringi::stri_trans_general(medio, "Latin-ASCII"))%>% 
+                rename(outlet = medio)
+```
+
+I also remove the digits contained in the text. 
+
+```{r, message=FALSE, warning=FALSE}
+corpus<-corpus %>% mutate(texto = str_replace_all(texto, '[[:digit:]]+', ''))
+```
+
+The "ordered" data, or _tidy data_, has the following structure (Wickham, 2014^[Wickham, Hadley. 2014. “Tidy Data.” Journal of Statistical Software, Articles 59 (10).]): each variable is a column; each unit or observation, a row; and each type of observational unit, a table. 
+
+In the case of _text mining_, the _tidy text_ structure will comprise **one token per row**. A token is a conceptually and/or analytically meaningful unit, and can be defined according to particular criteria: words, n-grams, expressions, etc. In this case, I will define the token as a word. 
+One of the first steps in the corpus preprocessing is its division into tokens, or _tokenization_. 
+
+With the _unnest_tokens()_ function, I tokenize the text and transform it into an ordered data structure: one token per row.
+
+
+```{r, message=FALSE, warning=FALSE}
+corpus_tidy <- corpus %>%
+        unnest_tokens(output = word, 
+                      input = texto) 
+
+```
+
+
+In the original file, each row was a news item. Now, each row is a word (a token), and each word is associated with the different variables included in the corpus metadata (date, media, title, etc). 
+The _unnest_tokens()_ function also performs certain default changes, such as shifting the text to lowercase and removing punctuation. These criteria can be modified according to particular preferences.
+
+
+
+In the next step, I am going to **remove the stopwords**. These are very frequent words that do not provide relevant information to the text, and it is convenient to discard them before proceeding with the text analysis. 
+The weight of stopwords is revealed by a first exploration of the most used words in the text. At the top of the list are words such as "de", "la", "que", "el", "en", "y", "a", "los": articles, pronouns, prepositions, adverbs or other words that do not provide relevant information on their own. In this case, _empty_ words.
+
+
+```{r, message=FALSE, warning=FALSE}
+corpus_tidy %>%
+        group_by(word) %>%
+        summarise(n=n()) %>%
+        arrange(desc(n))
+```
+
+
+To remove stopwords, I use a lexicon containing a series of stopwords ^[Note: I also remove the accents from the lexicon, and rename the column header with the stopwords list from "X1" to "word" (this will be useful for the anti_join in the next step)].
+
+It should be noted that, in this case, I added some words to the stopwords list after noticing that they were frequently used and did not add valuable information to the analysis.
+
+
+```{r, message=FALSE, warning=FALSE}
+stop_words <- read_csv('https://raw.githubusercontent.com/Alir3z4/stop-words/master/spanish.txt', col_names=FALSE) %>%
+        rename(word = X1) %>% 
+                mutate(word = stringi::stri_trans_general(word, "Latin-ASCII"))
+
+stop_words <- stop_words %>%
+                bind_rows( tibble(word=c('ano', 'anos', 'dia','gusta', 'comentar', 'compartir','guardar','mira','lea','enterate','newsletter', 'newsletters', 'minutouno','minutounocom', 'jpg', 'https','ratingcero', 'embed','infobae', 'infobaetv', 'protected', 'ftp','twitter', 'facebook','email', 'whatsapp','the','pic.twitter.com','ratingcero.com','cablera.telam.com.ar','perfil.com','ambito.com','minutouno.com','quey','t.co','clarin.com','the', 'levantes','organices','quedarte'))) 
+
+```
+
+
+Once the lexicon with stopwords is loaded, I apply the _anti_join()_ function between it and the corpus, to get all the words that are present in the latter but not in the former.
+
+
+```{r, message=FALSE, warning=FALSE}
+corpus_tidy <- corpus_tidy %>%
+        anti_join(stop_words)
+```
+
+
+I recheck the most mentioned words and confirmed that the stopwords were properly removed.
+
+```{r, message=FALSE, warning=FALSE}
+corpus_tidy %>%
+        group_by(word) %>%
+        summarise(n=n()) %>%
+        arrange(desc(n))
+```
+
+
+<br>
+
+## Identification of characteristic words for each news outlet
+
+
+I now return to the original goal of this section: **to identify the most characteristic words in each of the news outlets**.
+
+### Metrics: TF, IDF, TF-IDF
+
+One of the first ideas that intuitively comes to mind when trying to identify the most frequently used words by outlet is to **count** the number of times each word appears in each news outlet. However, this method has significant shortcomings, two of which stand out: the length of documents varies, and the information about meaning does not grow proportionally to the number of occurrences of a word in a document.
+The result of the raw count is shown in the following graph.
+
+
+```{r, message=FALSE, warning=FALSE}
+medio_palabras<-corpus_tidy %>%
+        group_by(outlet, word) %>%
+        summarise(n = n()) %>%
+        arrange(desc(n)) %>%
+        ungroup()
+
+medio_palabras %>%
+        group_by(outlet) %>%
+        slice_max(n, n = 10) %>%
+        ungroup() %>%
+        mutate(word = reorder_within(word, n, outlet)) %>%
+        ggplot(aes(n, word, fill = outlet)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~outlet, ncol = 2, scales = "free") +
+        scale_y_reordered()+
+        labs(x = "n", y = NULL) +
+        theme_minimal()+
+        theme(text=element_text(size=16,family="mono",face = "bold"))
+
+```
+
+
+
+Given the limitations of the raw count, I now consider some alternative metrics.
+
+
+The goal is to find a metric that balances two central dimensions of words: their **importance** (given by their frequency in a document) and their **informativeness** with respect to the content of that particular document (given by their presence in a few documents and not all documents in the corpus). 
+
+In this case, what I am trying to do is to identify the important _and_ informative words in each news outlet. To achieve this, I introduce the following metrics into the analysis:
+
+- The **TF** (_Term frequency_) reflects the **importance**. It measures the relative frequency of a word in a given document: the number of times the word appears in the document out of the total number of words in the document. In this sense, the TF overcomes one of the shortcomings of the raw count (documents of different sizes) by normalizing it in order to obtain comparable results.
+
+
+- The **IDF** (_Inverse document frequency_) reflects the **informativeness**. It is calculated as the logarithm of the corpus size (the total number of documents) divided by the number of documents containing the word in question. This metric increases the weight of words that are not widely used (in the corpus) at the expense of commonly used words.
+
+
+- The **TF-IDF** combines both metrics, balancing **importance and informativeness**. It is calculated by multiplying TF by IDF. This metric seeks to identify words that are important (common) and informative (not _too_ common). In short, the TF-IDF metric allows to identify _characteristic_ or _distinctive_ words of a document within a collection of documents (the corpus). 
+
+
+
+All three metrics can be easily obtained using the **bind_tfi_idf()** function of _tidytext_.
+
+```{r,message=FALSE, warning=FALSE}
+library(forcats)
+
+corpus_tf_idf <- medio_palabras %>%
+  mutate(outlet=recode(outlet, "Clarin" = "Clarín", "Pagina 12" = "Página 12", "La Nacion" = "La Nación")) %>% 
+  bind_tf_idf(word, outlet, n)
+
+library(kableExtra)
+kbltfidf1<-kable(head(corpus_tf_idf,20),caption="First 20 rows from table bind_tf_idf") %>%
+  row_spec(0,bold=TRUE) %>% 
+  kableExtra::kable_classic_2(full_width=TRUE) %>% 
+  column_spec(1, bold = T)
+
+kbltfidf1
+```
+
+
+
+Looking at the resulting table, one can see a number of words with a high TF and an IDF equal to zero. These are usually very common but not very informative words. If they had not been previously removed, this would be the case of stopwords.
+
+The deficiencies of limiting the analysis of words to their relative frequency are clearly reflected in the following graph, with the 10 words with the highest TF for each news outlet. It is practically impossible to detect relevant differences between each news outlet, given that the words with the highest TF tend to be common and present in the different newspapers: "government" (_gobierno_), "country" (_país_), "Argentina", "national" (_nacional_), "president" (_presidente_).
+
+
+
+```{r,message=FALSE, warning=FALSE}
+corpus_tf_idf %>%
+  group_by(outlet) %>%
+        slice_max(tf, n = 10) %>%
+        ungroup() %>%
+        mutate(word = reorder_within(word, tf, outlet)) %>%
+        ggplot(aes(tf, word, fill = outlet)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~outlet, ncol = 2, scales = "free") +
+        labs(x = "tf", y = NULL)+
+        scale_y_reordered()+
+        theme_minimal()+
+        theme(text=element_text(size=16,family="mono",face = "bold"))
+```
+
+
+```{r,include=FALSE}
+library(tarantino)
+p<-tarantino_palette('ReservoirDogs')
+```
+
+
+As mentioned, this problem can be avoided by using the TF-IDF metric, which balances importance and informativeness. When applied, these words quickly disappear from the ranking. The reason is simple: however high the TF value is, multiplying it by an IDF equal to zero will result in a TF_IDF equal to zero as well.
+
+
+### Final graph using TF-IDF
+
+I now identify the words with the highest TF-IDF for each news outlet:
+
+```{r,message=FALSE, warning=FALSE}
+corpus_tf_idf %>%
+  group_by(outlet) %>%
+        slice_max(tf_idf, n = 15) %>%
+        ungroup() %>%
+        ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = outlet)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~outlet, ncol = 2, scales = "free") +
+        labs(x = "tf_idf", y = NULL)+
+        theme_minimal()+
+  theme(text=element_text(size=16,family="mono",face = "bold"))
+
+```
+
+
+For the final graph, I take some additional steps such as downloading the color palette I will use, and indicating certain criteria such as the size and font of the text, the size of the graph, etc. 
+
+In the case of Perfil and Minuto Uno, certain words head the list (three words in Perfil, and six in Minuto Uno), and many others compete for the next places, so I decided to cut the number of words that appear in those graphs in order to be able to read the labels clearly (with the argument _with_ties = FALSE_). It is important to note that applying this trimming without a particular criterion, it could also influence how enlightening the graphs themselves are. 
+
+
+
+```{r,message=FALSE, warning=FALSE}
+corpus_tf_idf<-corpus_tf_idf %>% mutate(outlet=recode(outlet, "Clarin" = "Clarín", "Pagina 12" = "Página 12", "La Nacion" = "La Nación"))
+library(tarantino)
+p<-tarantino_palette('ReservoirDogs')
+```
+
+```{r,message=FALSE, warning=FALSE}
+library(forcats)
+
+plotpalabras<-corpus_tf_idf %>%
+  group_by(outlet) %>%
+        slice_max(tf_idf, n = 10,with_ties = FALSE) %>%
+        ungroup() %>%
+        ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = outlet)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~outlet, ncol = 2, scales = "free") +
+        labs(title="Most important and informative words from each news outlet
+(highest TF_IDF)",x = "tf-idf", y = NULL) +
+        theme_minimal()+
+  scale_fill_manual(values = p)+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 18,hjust = 0.5),text=element_text(size=15,  family="mono",face = "bold"),strip.text = element_text(size=17,face = "bold",family="mono"))
+```
+
+
+```{r,include=FALSE}
+plotTF<-corpus_tf_idf %>%
+  group_by(outlet) %>%
+        slice_max(tf, n = 10) %>%
+        ungroup() %>%
+        ggplot(aes(tf, fct_reorder(word, tf), fill = outlet)) +
+        geom_col(show.legend = FALSE) +
+        facet_wrap(~outlet, ncol = 2, scales = "free") +
+        labs(x = "tf", y = NULL)+
+        labs(title="Most frequent words -not necessarily informative- from each news outlet
+(highest TF)",x = "tf", y = NULL) +
+        theme_minimal()+
+  scale_fill_manual(values = p)+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 15,hjust = 0.5),text=element_text(size=15,  family="mono",face = "bold"),strip.text = element_text(size=17,face = "bold",family="mono"))
+```
+
+```{r, include=FALSE}
+png("plotTF.png",
+    units="in", width=10, height=8,res=300)
+print(plotTF)
+```
+
+
+
+```{r}
+png("plotpalabras.png",
+    units="in", width=10, height=8,res=300)
+print(plotpalabras)
+```
+
+
+```{r,message=FALSE, warning=FALSE, fig.align='center'}
+plotpalabras
+```
+
+
+
+
+## Topics: Latent Dirichlet Allocation (LDA)
+### Topic modeling 
+
+
+The next step is to **identify the main topics present in the corpus**.
+
+The *Latent Dirichlet Allocation (LDA)* method ^[The choice of the LDA model over STM was mainly due to computational limits and the burden of applying the STM model.] is an algorithm for topic modeling. It presents two central assumptions:
+
+1. Each document is a mixture of topics (i.e., it may contain words from various topics in different proportions).
+
+2. Each topic is a mixture of words (and these may be part of different topics).
+
+
+Using the LDA method, I will identify the combination of words within each topic and the combination of topics that make up each document.
+
+
+
+I load the package that I will use for these next steps.
+
+```{r,message=FALSE, warning=FALSE}
+library(topicmodels)
+```
+
+
+To perform topic modeling, I create a _document term matrix_: a matrix where rows correspond to documents; columns, to words; and values, to word counts. 
+
+To get to this matrix, I first generate the table with the counts.
+
+
+```{r,message=FALSE, warning=FALSE}
+word_counts <- corpus_tidy %>%
+        group_by(id, word) %>%
+        summarise(n=n()) %>%
+        ungroup()
+```
+
+
+I then transform it into a _document term matrix_ (needed by the _topicmodels_ package, which will perform the topic estimation).
+
+```{r,message=FALSE, warning=FALSE}
+disc_dtm <- word_counts %>%
+                cast_dtm(id, word, n)
+
+disc_dtm
+```
+
+The resulting matrix has 675,599,864 entries and only 1,146,136 entries are non-zero, so the matrix is almost 100% sparse (basically, the matrix is full of zeros).
+
+
+This document-term matrix will be the input to the _topicmodels_ package, which will estimate an LDA model. In this case, I instruct it to identify 14 topics.
+
+
+```{r,message=FALSE, warning=FALSE}
+lda_14 <- LDA(disc_dtm, k=14, control = list(seed = 1234))
+```
+
+I now explore the first 20 terms of each topic.
+
+```{r,message=FALSE, warning=FALSE}
+terms(lda_14,20)
+```
+
+To analyze the distribution of words for each topic, I apply the _tidy()_ function, which generates a one-topic-word-per-row format: for each possible combination, it estimates the probability of that word being generated from that topic (probability called "beta").
+
+
+```{r,message=FALSE, warning=FALSE}
+ap_topics <- tidy(lda_14, matrix = "beta")
+ap_topics<-ap_topics %>%
+  mutate(beta = round(beta, 5))
+ap_topics
+```
+
+
+From this process, I identify the 15 most common words within each topic. 
+
+
+```{r,message=FALSE, warning=FALSE}
+ap_top_terms <- ap_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 15) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+plottopicos<-ap_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales='free') +
+  scale_y_reordered() +
+        labs(title="Topics identified with LDA",y = "term") +
+        theme_minimal()+
+  scale_fill_manual(values = c(p,"#245C59","#707B5D","#696E68","#D7DA4C","#015c89","#B6523B","#8A7A23"))+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 18,hjust = 0.5),text=element_text(size=15,  family="mono",face = "bold"),strip.text = element_text(size=17,face = "bold",family="mono"))
+
+
+plottopicos
+```
+
+
+
+```{r,message=FALSE, warning=FALSE}
+png("plottopicos.png",
+    units="in", width=10, height=10,res=300)
+print(plottopicos)
+```
+
+
+
+
+
+<br>
+
+I proceed to **label** -to the extent possible- **each topic**:
+
+- 1. Football/sports
+- 2. Services and public spaces/urbanism
+- 3. National politics
+- 4. Legal cases/corruption
+- 5. Culture: focus on music and theater, shows, etc.
+- 6. Elections
+- 7. Politics of Latin American countries
+- 8. Development/education/technology
+- 9. Health
+- 10. Insecurity
+- 11. Economy
+- 12. International news
+- 13. Culture: focus on cinema and literature (+ broad topics such as love, life, family)
+- 14. International politics with a focus on conflicts/war/terrorism
+
+<br>
+
+I want to confirm if the difference I drew between topic 12 and 14 is correct. For this, I identify and visualize the words that have the largest difference in beta between the two topics. To narrow it down to meaningful words, I filter out words with a beta of 2/1000 in at least one topic (i.e., that their usage is relatively common).
+
+```{r,message=FALSE, warning=FALSE}
+beta_wide <- ap_topics %>%
+  mutate(topic = paste0("topic", topic)) %>%
+  pivot_wider(names_from = topic, values_from = beta) %>% 
+  filter(topic12 > .002 | topic14 > .002) %>%
+  mutate(log_ratio12_14 = log2(topic12 / topic14))
+
+```
+
+```{r,message=FALSE, warning=FALSE}
+plotdif<-beta_wide %>%
+  mutate(pos = log_ratio12_14 >= 0) %>% 
+  ggplot(aes(x=reorder(term,log_ratio12_14) , y=log_ratio12_14, fill=pos)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    labs(x='term',
+         y='Log2 ratio topic14/topic12') +
+        theme_minimal()+
+  scale_fill_manual(values = c("#245C59","#B6523B"))+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 18,hjust = 0.5),text=element_text(size=15,  family="mono",face = "bold"))
+```
+
+```{r,message=FALSE, warning=FALSE}
+png("plotdif.png",
+    units="in", width=10, height=5,res=300)
+print(plotdif)
+```
+
+
+```{r,message=FALSE, warning=FALSE, fig.align='center'}
+plotdif
+```
+
+In topic 14, words related to international conflicts stand out, such as "Syria", "France" -remember the attacks in France during this period-, "refugees", "forces", "security", "war" and "peace". In topic 12, this is the case for terms linked to US domestic politics ("hillary", "trump", "clinton", "republican" -remember Trump's victory in 2016-), to the church ("vatican", "pope", "church", "francisco") and to gender issues ("gender", "women" and -possibly- "sexual"? ^[At this point, the usefulness of n-grams to obtain a more detailed analysis of the topics present in the media during this period is clear. For example, although the word "sexual" can refer to a broad spectrum of topics, "sexual abuse" could emerge (or not) as a relevant term, clearly delimiting a particular topic]).
+
+
+### Topic composition by news outlet
+
+In the previous section, the analysis was guided by the first premise of LDA: each topic is a mixture of words. This section focuses on the second: each document is a mixture of topics. 
+
+I seek to **identify the topic composition of each news outlet**.
+
+I calculate the probabilities per document per topic (denoted "gamma") with the following code. These values reflect the estimated proportion of the words in a certain document that are generated from a certain topic.
+
+```{r,message=FALSE, warning=FALSE}
+doc_2_topics1 <- tidy(lda_14, matrix = "gamma")
+doc_2_topics1<-doc_2_topics1 %>%
+  mutate(gamma = round(gamma, 5))
+doc_2_topics1
+```
+
+I examine the composition of topics of each news outlet from the generated gamma matrix. 
+
+Then I apply a _left_join_ with the corpus ^[Note: in the process, I previously rename the "document" column as "id" and recover the accents in the newspapers names for the final graph. I also define the labels that I want to appear in the graph, so that it is easier to interpret].
+
+I calculate the average gamma for each topic for each outlet.
+
+
+```{r,message=FALSE, warning=FALSE}
+doc_2_topics<-doc_2_topics1 %>%
+  rename(id = document) %>%
+  mutate(id = as.integer(id)) %>%
+  left_join(corpus %>% select(id, outlet) %>% unique()) %>%
+  group_by(outlet, topic) %>%
+  summarise(mean = mean(gamma)*100)
+
+doc_2_topics<-doc_2_topics %>% mutate(outlet=recode(outlet, "Clarin" = "Clarín", "Pagina 12" = "Página 12", "La Nacion" = "La Nación"))
+```
+
+
+```{r,message=FALSE, warning=FALSE}
+etiq<-c("Football/sports", "Services and public spaces/urbanism","National politics","Legal cases/corruption","Culture: focus on music and theater","Elections","Politics of Latin American countries","Development/education/technology","Health","Insecurity","Economy","International news","Culture: focus on cinema and literature", "International conflicts")
+
+plottop<-doc_2_topics %>%
+  ggplot(aes(factor(topic), mean,fill=factor(topic)))+  
+  geom_col() +
+  facet_wrap(~ outlet,ncol = 4) +
+  labs(y = "mean")+
+        labs(title="Topics composition by news outlet") +
+        theme_minimal()+
+  scale_fill_manual(values = c(p,"#245C59","#707B5D","#696E68","#D7DA4C","#015c89","#B6523B","#8A7A23"),name = "Topic", labels=etiq)+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 24,hjust = 0.5),text=element_text(size=13,  family="mono",face = "bold"),strip.text = element_text(size=13,face = "bold",family="mono"),panel.spacing = unit(2, "lines"),legend.text = element_text(size=13),legend.title = element_text(size=13))
+
+plottop
+```
+
+```{r,message=FALSE, warning=FALSE}
+png("plottop.png",
+    units="in", width=18, height=11,res=300)
+print(plottop)
+```
+
+An alternative way to visualize the topics composition by news outlet is the following:
+
+```{r,message=FALSE, warning=FALSE, fig.align='center'}
+plottop2<-doc_2_topics %>%
+  ggplot(aes(factor(outlet), mean,fill=factor(topic),label=round(mean)))+  
+  geom_bar(position="stack", stat="identity") +
+  geom_text(size = 5,color="white",face="bold", position = position_stack(vjust = 0.5)) +
+  labs(x = "outlet", y = "mean")+
+        labs(title="Topics composition by news outlet") +
+        theme_minimal()+
+  scale_fill_manual(values = c(p,"#245C59","#707B5D","#696E68","#D7DA4C","#015c89","#B6523B","#8A7A23"),name = "Topic", labels=etiq)+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 24,hjust = 0.5),text=element_text(size=12,  family="mono",face = "bold"),axis.text.x = element_text(angle = 30, size=13,  family="mono",face = "bold",color="black"),strip.text = element_text(size=13,face = "bold",family="mono"),panel.spacing = unit(2, "lines"),legend.text = element_text(size=13),legend.title = element_text(size=13))
+
+
+plottop2
+```
+
+```{r,message=FALSE, warning=FALSE}
+png("plottop2.png",
+    units="in", width=18, height=11,res=300)
+print(plottop2)
+```
+
+
+
+
+### Trends over time
+
+Finally, I am interested in **analyzing the evolution of topics over time**.
+
+I apply a _left_join_ with the corpus, where the variable date appears.
+
+```{r,message=FALSE, warning=FALSE}
+doc_2_topicstemp<-doc_2_topics1 %>%
+  rename(id = document) %>%
+  mutate(id = as.integer(id)) %>%
+  left_join(corpus %>% select(id, fecha) %>% unique()) %>%
+  group_by(fecha, topic) %>%
+  summarise(mean = mean(gamma)*100)
+
+```
+
+I explore and visualize the evolution of the average gamma for each topic for each date, applying _geom_smooth()_ to discard noise and reveal the trend.
+
+```{r,message=FALSE, warning=FALSE}
+plottemp<-ggplot(doc_2_topicstemp, aes(x = fecha, y = mean, color=factor(topic))) + 
+  geom_smooth(size=2)+
+  scale_color_manual(values = c(p,"#245C59","#707B5D","#696E68","#D7DA4C","#015c89","#B6523B","#8A7A23"),name = "Topic", labels=etiq) +
+  facet_wrap(~topic, ncol = 3, scales = "free_y")+
+  labs(x = "date", y = "mean")+
+  labs(title="Trends over time") + 
+  scale_x_date(date_labels = "%b-%y",date_breaks  ="3 month")+
+  theme_minimal()+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 25,hjust = 0.5),text=element_text(size=17,  family="mono",face = "bold"),strip.text = element_text(size=19,face = "bold",family="mono"),panel.spacing = unit(2, "lines"),legend.text = element_text(size=14),legend.title = element_text(size=15),axis.text.x = element_text(angle = 45, hjust = 1.1,size=10,family="mono",face = "bold",color="black"))
+
+plottemp
+
+
+
+d=data.frame(date=as.Date(c("2015-08-09", "2015-10-25", "2015-11-22")), evento=c("Primary elections", "Presidential elections", "Ballotage"))
+
+plottempelecc<-ggplot(data=filter(doc_2_topicstemp,topic==6), aes(x = fecha, y = mean)) + 
+  geom_smooth(size=2,color="#245C59")+
+  labs(x = "date", y = "mean")+
+  labs(title="Evolution of the topic 'elections' over time",legend=FALSE) + 
+  scale_x_date(date_labels = "%b-%y",date_breaks  ="3 month")+
+  theme_minimal()+
+  theme(plot.title = element_text(family="mono",face = "bold",size = 25,hjust = 0.5),text=element_text(size=17,  family="mono",face = "bold"),strip.text = element_text(size=19,face = "bold",family="mono"),panel.spacing = unit(2, "lines"),axis.text.x = element_text(angle = 45, hjust = 1.1,size=10,family="mono",face = "bold",color="black"))+
+  geom_vline(data=d,mapping=aes(xintercept=date), linetype=2, colour='black')+
+geom_text(data=d, mapping=aes(x=date, y=12, label=evento), size=6, color="black", angle=90, vjust=-0.4, hjust=0)
+
+plottempelecc
+```
+
+
+```{r, include=FALSE}
+png("plottemp.png",
+    units="in", width=12, height=8,res=300)
+print(plottemp)
+png("plottempelecc.png",
+    units="in", width=10, height=6,res=300)
+print(plottempelecc)
+```
+
+
+
